@@ -186,6 +186,9 @@ template<typename T> T get_data(const std::vector<uint8_t> &data, size_t buffer_
  */
 inline bool coil_from_vector(int coil, const std::vector<uint8_t> &data) {
   auto data_byte = coil / 8;
+  if (data_byte < 0 || static_cast<size_t>(data_byte) >= data.size()) {
+    return false;
+  }
   return (data[data_byte] & (1 << (coil % 8))) > 0;
 }
 

@@ -7,6 +7,12 @@ namespace modbustcp_controller {
 
 static const char *const TAG = "modbustcp_controller";
 
+// A read response frame is capped at 260 bytes by ModbusTCP::process_buffer_(), which fits 125
+// registers; 125 is also the Modbus limit for FC 03/04. A range larger than that is never
+// transmitted (send() refuses it above 128 and the response would be discarded above 125), so
+// ranges are split at this size.
+static constexpr uint8_t MAX_REGISTERS_PER_RANGE = 125;
+
 void ModbusTCPController::setup() { this->create_register_ranges_(); }
 
 /*
@@ -99,6 +105,10 @@ void ModbusTCPController::process_modbus_data_(const ModbusCommandItem *response
 
 void ModbusTCPController::on_modbus_error(uint8_t function_code, uint8_t exception_code) {
   ESP_LOGE(TAG, "Modbus error function code: 0x%X exception: %d ", function_code, exception_code);
+  if (this->command_queue_.empty()) {
+    ESP_LOGW(TAG, "Modbus error received but no command is queued, ignoring");
+    return;
+  }
   // Remove pending command waiting for a response
   auto &current_command = this->command_queue_.front();
   if (current_command != nullptr) {
@@ -377,7 +387,8 @@ size_t ModbusTCPController::create_register_ranges_() {
 
           ESP_LOGV(TAG, "Re-use previous register - change to register: 0x%X %d offset=%u", curr->start_address,
                    curr->register_count, curr->offset);
-        } else if (curr->start_address == (r.start_address + r.register_count)) {
+        } else if (curr->start_address == (r.start_address + r.register_count) &&
+                   r.register_count + curr->register_count <= MAX_REGISTERS_PER_RANGE) {
           // this register can extend the current range
 
           // remove this sensore because start_address is changed (sort-order)
@@ -712,6 +723,12 @@ int64_t payload_to_number(const std::vector<uint8_t> &data, SensorValueType sens
                           uint32_t bitmask) {
   int64_t value = 0;  // int64_t because it can hold signed and unsigned 32 bits
 
+  if (offset > data.size()) {
+    // Otherwise data.size() - offset underflows, every "size >= N" check below passes and the decode
+    // reads past the buffer, publishing whatever happens to follow it in memory.
+    ESP_LOGE(TAG, "Payload of %zu bytes is shorter than offset %u, not decoding", data.size(), offset);
+    return 0;
+  }
   size_t size = data.size() - offset;
   bool error = false;
   switch (sensor_value_type) {

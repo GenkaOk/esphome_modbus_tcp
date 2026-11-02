@@ -149,18 +149,29 @@ void ModbusTCP::setup() {
       return;
     }
 
+    uint8_t unit_id = byte[6];
+    uint8_t function_code = byte[7] & 0x7F;
+
     if ((byte[7] & 0x80) == 0x80) {
+      uint8_t exception_code = frame_len > 8 ? byte[8] : 0;
       ESP_LOGE(TAG, "Error: ");
-      if (frame_len > 8) {
-        switch (byte[8]) {
-          case 0x01: ESP_LOGE(TAG, "Failure Code 0x01 ILLEGAL FUNCTION"); break;
-          case 0x02: ESP_LOGE(TAG, "Failure Code 0x02 ILLEGAL DATA ADDRESS"); break;
-          case 0x03: ESP_LOGE(TAG, "Failure Code 0x03 ILLEGAL DATA VALUE"); break;
-          case 0x04: ESP_LOGE(TAG, "Failure Code 0x04 SERVER FAILURE"); break;
-          case 0x05: ESP_LOGE(TAG, "Failure Code 0x05 ACKNOWLEDGE"); break;
-          case 0x06: ESP_LOGE(TAG, "Failure Code 0x06 SERVER BUSY"); break;
+      switch (exception_code) {
+        case 0x01: ESP_LOGE(TAG, "Failure Code 0x01 ILLEGAL FUNCTION"); break;
+        case 0x02: ESP_LOGE(TAG, "Failure Code 0x02 ILLEGAL DATA ADDRESS"); break;
+        case 0x03: ESP_LOGE(TAG, "Failure Code 0x03 ILLEGAL DATA VALUE"); break;
+        case 0x04: ESP_LOGE(TAG, "Failure Code 0x04 SERVER FAILURE"); break;
+        case 0x05: ESP_LOGE(TAG, "Failure Code 0x05 ACKNOWLEDGE"); break;
+        case 0x06: ESP_LOGE(TAG, "Failure Code 0x06 SERVER BUSY"); break;
+      }
+      // Hand the exception to the device instead of swallowing it: a legal "illegal data address"
+      // used to be indistinguishable from a dead device, so the command was retried until the
+      // controller declared it offline.
+      for (auto *device : this->devices_) {
+        if (device->address_ == unit_id) {
+          device->on_modbus_error(function_code, exception_code);
         }
       }
+      waiting_for_response = 0;
       return;
     }
 
@@ -168,7 +179,6 @@ void ModbusTCP::setup() {
     // the address (and the written value) straight after the function code — treating their byte 8
     // as a byte count dropped every ACK for addresses >= 1024 and handed an empty/garbage payload
     // to the write handler for smaller ones.
-    uint8_t function_code = byte[7] & 0x7F;
     bool has_byte_count = function_code >= 0x01 && function_code <= 0x04;
     size_t data_offset = has_byte_count ? 9 : 8;
 
@@ -190,9 +200,29 @@ void ModbusTCP::setup() {
     }
 
     std::vector<uint8_t> data(byte + data_offset, byte + data_offset + data_len);
+
+    // Deliver to the controller that owns this unit id. Without the filter every controller on the
+    // bus consumed every response and popped a command it had not sent.
+    bool matched = false;
     for (auto *device : this->devices_) {
-      device->on_modbus_data(data);
+      if (device->address_ == unit_id) {
+        device->on_modbus_data(data);
+        matched = true;
+      }
     }
+    if (!matched) {
+      // Some gateways answer with a unit id that differs from the request (e.g. 0 or 0xFF). Keep
+      // the old broadcast behaviour for them so that sensors still update.
+      ESP_LOGD(TAG, "No device configured for unit id %u, delivering response to all devices", unit_id);
+      for (auto *device : this->devices_) {
+        device->on_modbus_data(data);
+      }
+    }
+
+    // Cleared only after the frame has been handed over (and the command popped), so the main loop
+    // cannot resend the command that just got its answer. Doing it here instead of relying on the
+    // send_wait_time_ timeout lets the next command go out without paying a full 250 ms per request.
+    waiting_for_response = 0;
   }
 
   void ModbusTCP::on_shutdown() {

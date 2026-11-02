@@ -87,11 +87,11 @@ All entity platforms share this base:
 
 | Option           | Default    | Meaning                                                                        |
 | ---------------- | ---------- | ------------------------------------------------------------------------------ |
-| `address`        | —          | Register address (required unless `custom_command` is used)                     |
+| `address`        | —          | Register address, 0…65535 (required unless `custom_command` is used)            |
 | `register_type`  | see below  | `read` (input registers, FC 04), `holding` (FC 03), `coil` (FC 01/05), `discrete_input` (FC 02) |
 | `value_type`     | `U_WORD`   | `RAW`, `U_WORD`, `S_WORD`, `U_DWORD`, `S_DWORD`, `U_QWORD`, `S_QWORD`, `FP32` and their `_R` (word-swapped) variants |
-| `register_count` | from `value_type` | Number of 16-bit registers in the range                                  |
-| `offset` / `byte_offset` | `0` | Skip bytes inside the response (mutually exclusive)                          |
+| `register_count` | from `value_type` | Registers in the range, max 125 — neighbouring entities are merged into ranges of at most 125 |
+| `offset` / `byte_offset` | `0` | Skip bytes inside the response, 0…255 (mutually exclusive)                     |
 | `bitmask`        | `0xFFFFFFFF` | Mask off bits (and shift down) — this is how a `binary_sensor` picks one bit |
 | `skip_updates`   | `0`        | Poll this register only every N-th cycle                                        |
 | `force_new_range`| `false`    | Never merge this entity into a neighbouring read range                          |
@@ -180,6 +180,12 @@ text_sensor:
   new one.
 - Responses are matched against the transaction id of the last request. Late or foreign
   responses are dropped, not decoded.
+- A response is delivered only to the controller whose unit id matches, and the next command is
+  queued as soon as it arrives — polling is no longer limited to one command per
+  `send_wait_time`. If no controller matches the unit id (some gateways answer with a different
+  id), the response is delivered to all controllers.
+- A Modbus exception response is handed to the controller, which drops the pending command and
+  logs the reason, instead of retrying until the device is declared offline.
 
 ## Troubleshooting
 
@@ -191,6 +197,8 @@ text_sensor:
 | `Implausible Modbus TCP frame length ... discarding N buffered bytes` | Stream lost framing (usually right after a reconnect), buffer reset |
 | `Modbus response received but no command is queued, ignoring` | Stale frame after a reconnect, ignored |
 | `Modbus device=N set offline` | No response after `max_cmd_retries` attempts; raise `offline_skip_updates` if the device is permanently absent |
+| `Failure Code 0x02 ILLEGAL DATA ADDRESS` | The device rejected the request; the command is dropped instead of being retried until the device looks offline — check the register address |
+| `No device configured for unit id N` | The response's unit id matches no controller; it is still delivered to all of them, but check the `address:` values |
 
 If the ESP cannot get on WiFi at all after a reboot, check `reset_reason` and the WiFi
 disconnect reason in the log first — a reconnect storm used to be one contributor, but it is

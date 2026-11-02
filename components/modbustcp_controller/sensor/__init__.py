@@ -39,7 +39,7 @@ CONFIG_SCHEMA = cv.All(
         {
             cv.Optional(CONF_REGISTER_TYPE): cv.enum(MODBUS_REGISTER_TYPE),
             cv.Optional(CONF_VALUE_TYPE, default="U_WORD"): cv.enum(SENSOR_VALUE_TYPE),
-            cv.Optional(CONF_REGISTER_COUNT, default=0): cv.positive_int,
+            cv.Optional(CONF_REGISTER_COUNT, default=0): cv.int_range(min=0, max=125),
         }
     ),
     validate_modbus_register,

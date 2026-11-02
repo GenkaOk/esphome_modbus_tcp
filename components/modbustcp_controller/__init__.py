@@ -196,18 +196,18 @@ ModbusItemBaseSchema = cv.Schema(
     {
         cv.GenerateID(CONF_MODBUSTCP_CONTROLLER_ID): cv.use_id(ModbusTCPController),
         #cv.Optional(CONF_UNIT_ID): cv.positive_int,
-        cv.Optional(CONF_ADDRESS): cv.positive_int,
+        cv.Optional(CONF_ADDRESS): cv.int_range(min=0, max=65535),
         cv.Optional(CONF_CUSTOM_COMMAND): cv.ensure_list(cv.hex_uint8_t),
         cv.Exclusive(
             CONF_OFFSET,
             "offset",
             f"{CONF_OFFSET} and {CONF_BYTE_OFFSET} can't be used together",
-        ): cv.positive_int,
+        ): cv.int_range(min=0, max=255),
         cv.Exclusive(
             CONF_BYTE_OFFSET,
             "offset",
             f"{CONF_OFFSET} and {CONF_BYTE_OFFSET} can't be used together",
-        ): cv.positive_int,
+        ): cv.int_range(min=0, max=255),
         cv.Optional(CONF_BITMASK, default=0xFFFFFFFF): cv.hex_uint32_t,
         cv.Optional(CONF_SKIP_UPDATES, default=0): cv.positive_int,
         cv.Optional(CONF_FORCE_NEW_RANGE, default=False): cv.boolean,

@@ -18,6 +18,10 @@ void ModbusTCPBinarySensor::parse_and_publish(const std::vector<uint8_t> &data) 
       value = coil_from_vector(this->offset, data);
       break;
     default:
+      if (static_cast<size_t>(this->offset) + 2 > data.size()) {
+        ESP_LOGW(TAG, "Payload of %zu bytes is too short for offset %u, ignoring", data.size(), this->offset);
+        return;
+      }
       value = get_data<uint16_t>(data, this->offset) & this->bitmask;
       break;
   }
