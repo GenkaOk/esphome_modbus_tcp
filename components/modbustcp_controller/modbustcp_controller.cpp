@@ -60,6 +60,12 @@ bool ModbusTCPController::send_next_command_() {
 
 // Queue incoming response
 void ModbusTCPController::on_modbus_data(const std::vector<uint8_t> &data) {
+  if (this->command_queue_.empty()) {
+    // A stale frame from the previous connection can still match the expected transaction id right
+    // after a reconnect; front() on an empty deque is undefined behaviour, so bail out early.
+    ESP_LOGW(TAG, "Modbus response received but no command is queued, ignoring");
+    return;
+  }
   auto &current_command = this->command_queue_.front();
   if (current_command != nullptr) {
     if (this->module_offline_) {

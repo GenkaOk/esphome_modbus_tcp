@@ -30,3 +30,9 @@
 *.exe
 *.out
 *.app
+
+# Python / ESPHome
+__pycache__/
+*.pyc
+.esphome/
+.repowise/

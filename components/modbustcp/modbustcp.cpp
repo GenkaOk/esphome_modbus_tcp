@@ -2,7 +2,7 @@
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
-//#include "esphome/components/network/util.h"
+#include "esphome/components/network/util.h"
 
 namespace esphome::modbustcp {
 
@@ -21,7 +21,17 @@ void ModbusTCP::setup() {
       auto* self = (ModbusTCP*)arg;
       ESP_LOGW("tcp", "Disconnected, will retry...");
       self->connected_ = false;
-      self->last_attempt_ = 0;
+      // Start the 5 s backoff at the moment of the disconnect. Leaving last_attempt_ at 0 made
+      // loop() see "more than 5 s since the last attempt" on the very next iteration and reconnect
+      // immediately, so a server that drops the new connection right away (e.g. a gateway still
+      // holding the stale one) turned into a tight connect/disconnect loop that also churned
+      // through LWIP sockets and could take the WiFi connection down with it.
+      self->last_attempt_ = millis();
+      // Whatever is left in the receive buffer belongs to the dead connection. A truncated frame
+      // would be glueing itself to the first response of the next connection and desynchronise
+      // the parser, and no response can arrive for the command we were waiting on.
+      self->rx_buffer_.clear();
+      self->waiting_for_response = 0;
     }, this);
 
     client_->onError([](void* arg, AsyncClient* c, int8_t err) {
@@ -182,7 +192,9 @@ void ModbusTCP::setup() {
     
 
 void ModbusTCP::loop() {
-  if (!connected_) {
+  // Only (re)connect when there is an actual network. After a reboot this component's loop runs
+  // before WiFi has an IP; attempts made there fail anyway and each one burns an LWIP socket.
+  if (!connected_ && network::is_connected()) {
       uint32_t nowtcp = millis();
       if (nowtcp - last_attempt_ > 5000) {
         last_attempt_ = nowtcp;
