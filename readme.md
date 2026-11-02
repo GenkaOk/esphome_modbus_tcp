@@ -208,6 +208,8 @@ not the only possible cause.
 - **`custom_command` / `register_type: custom` is not usable yet.** Raw commands go through
   `send_raw()`, which does not record a transaction id, so the response is rejected by the
   transaction-id check and the command times out.
+- **`number` with `value_type: RAW` cannot be written.** RAW has no payload encoding; the write
+  is rejected with `has no payload encoding` instead of crashing. Reads of RAW entities work.
 
 ## Alternative: upstream `modbus` over a serial-over-TCP bridge
 

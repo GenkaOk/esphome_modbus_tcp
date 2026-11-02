@@ -116,7 +116,7 @@ async def to_code(config):
         template_ = await cg.process_lambda(
             config[CONF_WRITE_LAMBDA],
             [
-                (ModbusNumber.operator("ptr"), "item"),
+                (ModbusTCPNumber.operator("ptr"), "item"),
                 (cg.float_, "x"),
                 (cg.std_vector.template(cg.uint16).operator("ref"), "payload"),
             ],

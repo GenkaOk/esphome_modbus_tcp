@@ -55,31 +55,23 @@ void ModbusTCP::setup() {
     }
   }
 
-  void ModbusTCP::send_message(const uint8_t *send_byte) {
+  void ModbusTCP::send_message(const uint8_t *send_byte, size_t len) {
     if (connected_ && client_->canSend()) {
-      //client_->write(message.c_str());
-      //client_->write(reinterpret_cast<const char*>(frame.data.get()), sizeof(frame.data));
+      // Send exactly the frame that was built. Deriving the length from the MBAP field instead
+      // silently truncated write-multiple frames.
+      client_->write(reinterpret_cast<const char*>(send_byte), len);
 
-    
-   //for (size_t i = 0; i < sizeof(send_byte); i++) {
-    //sprintf(buf1, "%02X", send_byte[i]);
+      std::string res1;
+      char buf1[5];
+      for (size_t i = 12; i < len; i++) {
+        sprintf(buf1, "%02X", send_byte[i]);
+        res1 += buf1;
+        res1 += ":";
+      }
+      ESP_LOGD("modbus_tcp", ">>> %02X%02X %02X%02X %02X%02X %02X %02X %02X%02X %02X%02X %s",
+                   send_byte[0], send_byte[1], send_byte[2], send_byte[3], send_byte[4], send_byte[5],
+                   send_byte[6], send_byte[7], send_byte[8], send_byte[9], send_byte[10], send_byte[11], res1.c_str());
 
-      client_->write(reinterpret_cast<const char*>(send_byte), (send_byte[5] + 6));
-      
-        
-     std::string res1;
-     char buf1[5];
-      
-     //for (size_t i = 12; i < send_byte[5] + 6; i++) {
-     for (size_t i = 12; i < send_byte[5] + 6; i++) {
-     sprintf(buf1, "%02X", send_byte[i]);
-     res1 += buf1;
-     res1 += ":";
-     }
-     ESP_LOGD("modbus_tcp", ">>> %02X%02X %02X%02X %02X%02X %02X %02X %02X%02X %02X%02X %s",
-                   send_byte[0], send_byte[1],  send_byte[2], send_byte[3], send_byte[4], send_byte[5],
-                   send_byte[6], send_byte[7],  send_byte[8], send_byte[9], send_byte[10], send_byte[11], res1.c_str());
-                  
       } else {
       ESP_LOGW("modbus_tcp", "Cannot send, not connected");
     }
@@ -128,6 +120,12 @@ void ModbusTCP::setup() {
   }
 
   void ModbusTCP::handle_frame_(const uint8_t *byte, size_t frame_len) {
+    // Smallest frame that can be decoded: MBAP header (7) + function code (1).
+    if (frame_len < 8) {
+      ESP_LOGW(TAG, "Modbus frame too short (%zu bytes), discarding", frame_len);
+      return;
+    }
+
     uint16_t transaction_id = (uint16_t(byte[0]) << 8) | byte[1];
 
     std::string res;
@@ -166,18 +164,32 @@ void ModbusTCP::setup() {
       return;
     }
 
-    if (frame_len < 9) {
-      ESP_LOGW(TAG, "Modbus response too short to contain a byte count (%zu bytes), discarding", frame_len);
+    // Only read responses (FC 01-04) carry a leading byte count. Write ACKs (FC 05/06/0F/10) echo
+    // the address (and the written value) straight after the function code — treating their byte 8
+    // as a byte count dropped every ACK for addresses >= 1024 and handed an empty/garbage payload
+    // to the write handler for smaller ones.
+    uint8_t function_code = byte[7] & 0x7F;
+    bool has_byte_count = function_code >= 0x01 && function_code <= 0x04;
+    size_t data_offset = has_byte_count ? 9 : 8;
+
+    if (frame_len < data_offset) {
+      ESP_LOGW(TAG, "Modbus response too short (%zu bytes) for function code 0x%02X, discarding", frame_len,
+               function_code);
       return;
     }
 
-    size_t data_len = byte[8];
-    if (9 + data_len > frame_len) {
-      ESP_LOGW(TAG, "Modbus response byte count (%zu) exceeds frame length (%zu), discarding", data_len, frame_len);
-      return;
+    size_t data_len;
+    if (has_byte_count) {
+      data_len = byte[8];
+      if (data_offset + data_len > frame_len) {
+        ESP_LOGW(TAG, "Modbus response byte count (%zu) exceeds frame length (%zu), discarding", data_len, frame_len);
+        return;
+      }
+    } else {
+      data_len = frame_len - data_offset;
     }
 
-    std::vector<uint8_t> data(byte + 9, byte + 9 + data_len);
+    std::vector<uint8_t> data(byte + data_offset, byte + data_offset + data_len);
     for (auto *device : this->devices_) {
       device->on_modbus_data(data);
     }
@@ -225,7 +237,7 @@ void ModbusTCP::dump_config() {
 
 float ModbusTCP::get_setup_priority() const { return setup_priority::AFTER_WIFI - 1.0f; }
 
-void ModbusTCP::send(uint8_t address, uint8_t function_code, uint16_t start_address, uint16_t number_of_entities, uint8_t payload_len, const uint8_t *payload) {
+void ModbusTCP::send(uint8_t address, uint8_t function_code, uint16_t start_address, uint16_t number_of_entities, size_t payload_len, const uint8_t *payload) {
   static const size_t MAX_VALUES = 128;
  const uint32_t now = App.get_loop_component_start_time();
   // Only check max number of registers for standard function codes
@@ -243,11 +255,7 @@ void ModbusTCP::send(uint8_t address, uint8_t function_code, uint16_t start_addr
       data[pos++] = 0x00;
       data[pos++] = 0x00;
       data[pos++] = 0x00;
-        if (payload != nullptr) { 
-          data[pos++] = (0x04 + payload_len);
-        }else {
-        data[pos++] = 0x06;      // how many bytes next comes for request
-      }
+      data[pos++] = 0x00;  // MBAP length low byte; filled in below once the frame is complete
       data[pos++] = address;
       data[pos++] = function_code;
       data[pos++] = start_address >> 8;
@@ -265,10 +273,10 @@ void ModbusTCP::send(uint8_t address, uint8_t function_code, uint16_t start_addr
     }
 
     if (payload_len + pos > MAX_FRAME_SIZE) {  // Check if send more as 256 bytes
-      ESP_LOGE(TAG, "Payload too large to send: %d bytes", payload_len);
+      ESP_LOGE(TAG, "Payload too large to send: %zu bytes", payload_len);
       return;
     }
-    for (int i = 0; i < payload_len; i++) {
+    for (size_t i = 0; i < payload_len; i++) {
       data[pos++] = payload[i];
     }
   }
@@ -276,7 +284,11 @@ void ModbusTCP::send(uint8_t address, uint8_t function_code, uint16_t start_addr
        
        expected_transaction_id_ = Transaction_Identifier;
        Transaction_Identifier++;
- send_message(data);
+  // MBAP length field = unit id + PDU = everything after the first six bytes. Deriving it from the
+  // frame we actually built is what makes write-multiple work: the hand-computed 0x04 + payload_len
+  // used to be three bytes short, so the byte count and the payload were never transmitted.
+  data[5] = pos - 6;
+  send_message(data, pos);
 
 waiting_for_response = address;
 last_send_ = millis();

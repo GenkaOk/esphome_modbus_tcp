@@ -63,6 +63,13 @@ void ModbusTCPNumber::control(float value) {
         });
   } else {
     data = float_to_payload(write_value, this->sensor_value_type);
+    if (data.empty()) {
+      // Types without an encoder (RAW) produce no payload at all; the write path below would then
+      // index data[0] on an empty vector.
+      ESP_LOGE(TAG, "Cannot write value: value_type %d has no payload encoding",
+               static_cast<int>(this->sensor_value_type));
+      return;
+    }
 
     ESP_LOGD(TAG,
              "Updating register: connected Sensor=%s start address=0x%X register count=%d new value=%.02f (val=%.02f)",
