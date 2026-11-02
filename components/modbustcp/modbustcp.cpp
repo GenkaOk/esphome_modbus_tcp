@@ -1,4 +1,5 @@
 #include "modbustcp.h"
+#include <new>
 #include "esphome/core/application.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
@@ -9,7 +10,14 @@ namespace esphome::modbustcp {
 static const char *const TAG = "modbustcp";
 
 void ModbusTCP::setup() {
-       client_ = new AsyncClient();
+    client_ = new (std::nothrow) AsyncClient();
+    if (client_ == nullptr) {
+      // Without a client this component cannot do anything. Mark it failed instead of crashing:
+      // ESPHome then skips it and the rest of the firmware keeps running.
+      ESP_LOGE(TAG, "Failed to allocate AsyncClient, component disabled");
+      this->mark_failed();
+      return;
+    }
 
     client_->onConnect([](void* arg, AsyncClient* c) {
       auto* self = (ModbusTCP*)arg;
@@ -27,11 +35,10 @@ void ModbusTCP::setup() {
       // holding the stale one) turned into a tight connect/disconnect loop that also churned
       // through LWIP sockets and could take the WiFi connection down with it.
       self->last_attempt_ = millis();
-      // Whatever is left in the receive buffer belongs to the dead connection. A truncated frame
-      // would be glueing itself to the first response of the next connection and desynchronise
-      // the parser, and no response can arrive for the command we were waiting on.
-      self->rx_buffer_.clear();
-      self->waiting_for_response = 0;
+      // This runs in the async_tcp task: only raise a flag. loop() drops whatever is left from the
+      // dead connection — a truncated frame there would glue itself to the first response of the
+      // next connection and desynchronise the parser.
+      self->reset_requested_.store(true);
     }, this);
 
     client_->onError([](void* arg, AsyncClient* c, int8_t err) {
@@ -48,19 +55,26 @@ void ModbusTCP::setup() {
   
 
       void ModbusTCP::connect() {
-    if (!client_->connecting()) {
-      if (!client_->connect(host_.c_str(), port_)) {
-        ESP_LOGW("tcp", "Connection failed, will retry...");
-      }
+    if (client_ == nullptr || client_->connecting()) {
+      return;
+    }
+    if (!client_->connect(host_.c_str(), port_)) {
+      ESP_LOGW("tcp", "Connection failed, will retry...");
     }
   }
 
   void ModbusTCP::send_message(const uint8_t *send_byte, size_t len) {
+    if (client_ == nullptr) {
+      return;
+    }
     if (connected_ && client_->canSend()) {
       // Send exactly the frame that was built. Deriving the length from the MBAP field instead
       // silently truncated write-multiple frames.
       client_->write(reinterpret_cast<const char*>(send_byte), len);
 
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
+      // Building the hex dump allocates, so keep it out of the code path entirely when the level
+      // is not compiled in.
       std::string res1;
       char buf1[5];
       for (size_t i = 12; i < len; i++) {
@@ -71,22 +85,50 @@ void ModbusTCP::setup() {
       ESP_LOGD("modbus_tcp", ">>> %02X%02X %02X%02X %02X%02X %02X %02X %02X%02X %02X%02X %s",
                    send_byte[0], send_byte[1], send_byte[2], send_byte[3], send_byte[4], send_byte[5],
                    send_byte[6], send_byte[7], send_byte[8], send_byte[9], send_byte[10], send_byte[11], res1.c_str());
+#endif
 
       } else {
       ESP_LOGW("modbus_tcp", "Cannot send, not connected");
     }
   }
 
-  // Appends the freshly-received bytes to rx_buffer_ and hands off to process_buffer_() to pull
-  // out however many complete frames are now available. A single onData call is not guaranteed
-  // to line up with frame boundaries — TCP can fragment a frame across several calls, or coalesce
-  // more than one frame (e.g. from a busy Modbus TCP proxy) into a single call.
+  // Called from the async_tcp task. Staging only — the bytes are parsed from loop(), together with
+  // everything else that touches shared state. A single onData call is not guaranteed to line up
+  // with frame boundaries (TCP can fragment a frame across calls, or coalesce several frames), so
+  // loop() reassembles them from rx_buffer_.
   void ModbusTCP::handle_message(const uint8_t *data, size_t len) {
-    if (len == 0) {
+    if (len == 0 || data == nullptr) {
       return;
     }
-    rx_buffer_.insert(rx_buffer_.end(), data, data + len);
-    process_buffer_();
+    this->rx_stage_push_(data, len);
+  }
+
+  void ModbusTCP::rx_stage_push_(const uint8_t *data, size_t len) {
+    uint32_t head = this->rx_stage_head_.load(std::memory_order_relaxed);
+    uint32_t tail = this->rx_stage_tail_.load(std::memory_order_acquire);
+    size_t free_bytes = RX_STAGE_SIZE - static_cast<size_t>(head - tail);
+    if (len > free_bytes) {
+      // Dropping a partial chunk would leave the parser stuck on an impossible length, so drop the
+      // whole chunk and let loop() discard whatever it had buffered.
+      this->rx_stage_dropped_.fetch_add(static_cast<uint32_t>(len), std::memory_order_relaxed);
+      return;
+    }
+    for (size_t i = 0; i < len; i++) {
+      this->rx_stage_[(head + i) & (RX_STAGE_SIZE - 1)] = data[i];
+    }
+    this->rx_stage_head_.store(head + static_cast<uint32_t>(len), std::memory_order_release);
+  }
+
+  size_t ModbusTCP::rx_stage_pop_(uint8_t *out, size_t max) {
+    uint32_t head = this->rx_stage_head_.load(std::memory_order_acquire);
+    uint32_t tail = this->rx_stage_tail_.load(std::memory_order_relaxed);
+    size_t available = static_cast<size_t>(head - tail);
+    size_t n = available < max ? available : max;
+    for (size_t i = 0; i < n; i++) {
+      out[i] = this->rx_stage_[(tail + i) & (RX_STAGE_SIZE - 1)];
+    }
+    this->rx_stage_tail_.store(tail + static_cast<uint32_t>(n), std::memory_order_release);
+    return n;
   }
 
   // Extracts and dispatches every complete Modbus TCP ADU currently sitting in rx_buffer_,
@@ -128,6 +170,7 @@ void ModbusTCP::setup() {
 
     uint16_t transaction_id = (uint16_t(byte[0]) << 8) | byte[1];
 
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
     std::string res;
     char buf[5];
     for (size_t i = 8; i < frame_len; i++) {
@@ -138,6 +181,7 @@ void ModbusTCP::setup() {
 
     ESP_LOGD("modbus_tcp", " <<< %02X%02X %02X%02X %02X%02X %02X %02X %s ", byte[0], byte[1], byte[2], byte[3],
              byte[4], byte[5], byte[6], byte[7], res.c_str());
+#endif
 
     if (transaction_id != expected_transaction_id_) {
       // Late/stray response (e.g. arrived after the controller already gave up and moved on to
@@ -234,6 +278,36 @@ void ModbusTCP::setup() {
     
 
 void ModbusTCP::loop() {
+  if (this->is_failed()) {
+    return;
+  }
+
+  // Applied here because onDisconnect runs in the async_tcp task and must not touch the parser
+  // state: a truncated frame from the dead connection would glue itself to the first response of
+  // the next one, and no response can arrive for the command we were waiting on.
+  if (this->reset_requested_.exchange(false)) {
+    this->rx_buffer_.clear();
+    this->waiting_for_response = 0;
+    this->rx_stage_tail_.store(this->rx_stage_head_.load(std::memory_order_acquire), std::memory_order_release);
+  }
+
+  uint32_t dropped = this->rx_stage_dropped_.exchange(0, std::memory_order_relaxed);
+  if (dropped > 0) {
+    ESP_LOGW(TAG, "Receive staging buffer full, dropped %u bytes and resynchronising", dropped);
+    this->rx_buffer_.clear();
+  }
+
+  uint8_t chunk[128];
+  bool received = false;
+  size_t n;
+  while ((n = this->rx_stage_pop_(chunk, sizeof(chunk))) > 0) {
+    this->rx_buffer_.insert(this->rx_buffer_.end(), chunk, chunk + n);
+    received = true;
+  }
+  if (received) {
+    this->process_buffer_();
+  }
+
   // Only (re)connect when there is an actual network. After a reboot this component's loop runs
   // before WiFi has an IP; attempts made there fail anyway and each one burns an LWIP socket.
   if (!connected_ && network::is_connected()) {
@@ -326,7 +400,7 @@ last_send_ = millis();
 
 
 void ModbusTCP::send_raw(const std::vector<uint8_t> &payload) {
-  if (payload.empty()) {
+  if (payload.empty() || client_ == nullptr) {
     return;
   }
 

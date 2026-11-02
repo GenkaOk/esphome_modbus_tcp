@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <memory>
+#include <atomic>
 #include <vector>
 #include <queue>
 namespace esphome::modbustcp {
@@ -36,9 +37,8 @@ class ModbusTCP :  public Component {
   void set_send_wait_time(uint16_t time_in_ms) { send_wait_time_ = time_in_ms; }
   void set_host(const std::string &host) { this->host_ = host; }
   void set_port(uint16_t port) { this->port_ = port; }
-  // data/len come straight from AsyncClient::onData — a single call is not guaranteed to
-  // contain exactly one Modbus frame (TCP may fragment or coalesce), so incoming bytes are
-  // appended to rx_buffer_ and complete frames are extracted from there.
+  // data/len come straight from AsyncClient::onData. The callback runs in the async_tcp task, so
+  // this only stages the bytes; loop() reassembles frames and does all the parsing.
   void handle_message(const uint8_t *data, size_t len);
   void on_shutdown() override;
   void connect();
@@ -46,6 +46,21 @@ class ModbusTCP :  public Component {
   void send_message(const uint8_t *send_byte, size_t len);
 
  protected:
+
+  // Bytes arrive in the async_tcp task, but everything else (frame parsing, command queues, device
+  // callbacks, user automations) must happen in the main loop. The task therefore only copies the
+  // received bytes into this single-producer/single-consumer ring, which needs no lock: the task
+  // owns head, loop() owns tail.
+  static constexpr size_t RX_STAGE_SIZE = 1024;  // power of two
+  void rx_stage_push_(const uint8_t *data, size_t len);
+  size_t rx_stage_pop_(uint8_t *out, size_t max);
+  uint8_t rx_stage_[RX_STAGE_SIZE];
+  std::atomic<uint32_t> rx_stage_head_{0};
+  std::atomic<uint32_t> rx_stage_tail_{0};
+  std::atomic<uint32_t> rx_stage_dropped_{0};
+  // Set by onDisconnect (async_tcp task) and applied by loop(): the callback must not clear
+  // rx_buffer_ or touch the command state.
+  std::atomic<bool> reset_requested_{false};
 
   void process_buffer_();
   void handle_frame_(const uint8_t *frame, size_t frame_len);

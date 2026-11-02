@@ -204,6 +204,22 @@ If the ESP cannot get on WiFi at all after a reboot, check `reset_reason` and th
 disconnect reason in the log first — a reconnect storm used to be one contributor, but it is
 not the only possible cause.
 
+## Failure handling
+
+- All frame parsing, command-queue work and user callbacks (`on_online`, `on_offline`,
+  `on_command_sent`, lambdas) run in the ESPHome main loop. The `async_tcp` task only copies the
+  received bytes into a fixed 1 KB staging buffer, so a burst of traffic can never run component or
+  user code from that task.
+- If more than 1 KB piles up before the loop drains it, the chunk is dropped with
+  `Receive staging buffer full, dropped N bytes` and the parser resynchronises instead of growing
+  the heap without bound.
+- If the TCP client cannot be allocated at startup, the component logs the error and marks itself
+  failed — ESPHome skips a failed component and the rest of the firmware keeps running.
+- A Modbus exception drops only the offending command; polling continues.
+- ESPHome's built-in safe mode still applies: after 10 failed boots (configurable with
+  `safe_mode: num_attempts:`) the device boots with the components disabled, which is enough to
+  reach it over OTA and fix the config.
+
 ## Known limitations
 
 - One Modbus unit id per controller; one TCP connection per bus.
